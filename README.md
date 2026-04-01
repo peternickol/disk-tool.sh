@@ -35,7 +35,7 @@ It is designed as a single portable command with:
 - apt-based setup
 - a simple public CLI
 - strong destructive-operation warnings
-- timestamped per-device logs
+- optional timestamped per-device logs
 - file hashing and image inspection helpers
 - install and update helpers
 - bash completion support
@@ -113,6 +113,7 @@ Safety behaviors:
 - destructive commands require typing the exact target path unless `--yes` is used
 - destructive commands refuse mounted target devices by default
 - `--force` can override the mounted-device refusal
+- `--log` enables log file output for commands that support logging
 - `--dry-run` prints the command or command sequence that would run without executing it
 
 `--yes` is intended for trusted automation or experienced use. It should be used
@@ -331,13 +332,14 @@ Notes:
 
 - this is not destructive
 - it can heavily load the selected disk
-- it writes logs to the per-device log directory
+- use `--log` if you want a benchmark log written to disk
 - it currently runs a timed read test for 30 seconds
 
 Example:
 
 ```bash
 sudo disk-tool benchmark /dev/nvme0n1
+sudo disk-tool benchmark --log /dev/nvme0n1
 ```
 
 ### `disk-tool dd SOURCE TARGET`
@@ -512,13 +514,14 @@ Notes:
 
 - destructive
 - mounted targets are refused unless `--force` is used
-- logs are written for each run
+- use `--log` if you want `badblocks`, `fio`, and command output saved to disk
 - `fio` is configured for a one-hour timed run
 
 Example:
 
 ```bash
 sudo disk-tool drive /dev/sde burnin
+sudo disk-tool drive --log /dev/sde burnin
 ```
 
 ##### `discard`
@@ -601,7 +604,10 @@ sudo disk-tool drive /dev/sdf shred-erase
 
 ## Logging
 
-Drive and benchmark operations create timestamped log directories automatically.
+Logging is off by default.
+
+Use `--log` with supported commands when you want timestamped log files written
+to disk.
 
 Default log location:
 
@@ -628,6 +634,14 @@ You can override the log location with:
 
 ```bash
 export DISK_TOOL_LOG_DIR="$HOME/disk-logs"
+```
+
+Examples:
+
+```bash
+sudo disk-tool benchmark --log /dev/nvme0n1
+sudo disk-tool drive --log /dev/sdc burnin
+sudo disk-tool drive --log /dev/sdd smart
 ```
 
 ## Typical Workflows

@@ -20,6 +20,7 @@ AUTO_YES=0
 NO_COMPLETION=0
 DRY_RUN=0
 DD_VERIFY=0
+LOG_ENABLED=0
 
 EXIT_USAGE=2
 EXIT_DEPENDENCY=3
@@ -72,6 +73,7 @@ Setup:
 
 General:
   -y, --yes                  Skip destructive confirmation prompts
+  --log                      Write command logs to disk for supported commands
   --dry-run                  Show destructive commands without executing them
   --help                     Show this help text
   --version                  Show version information
@@ -163,6 +165,9 @@ parse_all_flags() {
       --no-completion)
         NO_COMPLETION=1
         ;;
+      --log)
+        LOG_ENABLED=1
+        ;;
       --dry-run)
         DRY_RUN=1
         ;;
@@ -193,6 +198,10 @@ parse_leading_flags() {
         ;;
       --no-completion)
         NO_COMPLETION=1
+        shift
+        ;;
+      --log)
+        LOG_ENABLED=1
         shift
         ;;
       --dry-run)
@@ -755,6 +764,11 @@ run_logged_command() {
     return 0
   fi
 
+  if [[ "$LOG_ENABLED" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+
   if "$@" > >(tee -a "$log_file") 2> >(tee -a "$log_file" >&2); then
     return 0
   fi
@@ -766,7 +780,7 @@ run_logged_command() {
 
 capture_to_log() {
   local log_file="$1"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
+  if [[ "$DRY_RUN" -eq 1 || "$LOG_ENABLED" -eq 0 ]]; then
     cat
   else
     tee -a "$log_file"
@@ -865,7 +879,7 @@ run_benchmark() {
   device_slug="$(basename -- "$device_path")"
   log_dir="$(drive_log_dir "$device_slug")"
   log_file="$log_dir/benchmark.log"
-  if [[ "$DRY_RUN" -eq 0 ]]; then
+  if [[ "$LOG_ENABLED" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
     mkdir -p "$log_dir"
   fi
 
@@ -879,8 +893,10 @@ run_benchmark() {
   ok "==> Benchmark completed"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     ok "==> No logs were written because this was a dry run"
-  else
+  elif [[ "$LOG_ENABLED" -eq 1 ]]; then
     ok "==> Logs saved in $log_dir"
+  else
+    ok "==> Logging was not enabled"
   fi
 }
 
@@ -919,11 +935,15 @@ run_drive() {
   device_slug="$(basename -- "$device_path")"
   log_dir="$(drive_log_dir "$device_slug")"
   log_file="$log_dir/${mode}.log"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
+  if [[ "$DRY_RUN" -eq 1 && "$LOG_ENABLED" -eq 1 ]]; then
     log "==> Dry run log path would be $log_file"
-  else
+  elif [[ "$DRY_RUN" -eq 1 ]]; then
+    log "==> Dry run with logging disabled"
+  elif [[ "$LOG_ENABLED" -eq 1 ]]; then
     mkdir -p "$log_dir"
     log "==> Logging to $log_file"
+  else
+    log "==> Logging disabled"
   fi
 
   case "$mode" in
@@ -1008,13 +1028,27 @@ run_drive() {
       show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command sequence about to be run:"
-      echo "  badblocks -o $log_dir/badblocks.txt $device_path"
-      echo "  fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename=$device_path --output=$log_dir/fio.log"
+      if [[ "$LOG_ENABLED" -eq 1 ]]; then
+        echo "  badblocks -o $log_dir/badblocks.txt $device_path"
+        echo "  fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename=$device_path --output=$log_dir/fio.log"
+      else
+        echo "  badblocks $device_path"
+        echo "  fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename=$device_path"
+      fi
       echo "  smartctl --health $device_path"
       echo
-      confirm_destructive_action "This performs a destructive full-device burn-in and writes detailed logs." "$device_path"
-      run_logged_command "$log_file" badblocks -o "$log_dir/badblocks.txt" "$device_path"
-      run_logged_command "$log_file" fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename="$device_path" --output="$log_dir/fio.log"
+      if [[ "$LOG_ENABLED" -eq 1 ]]; then
+        confirm_destructive_action "This performs a destructive full-device burn-in and writes detailed logs." "$device_path"
+      else
+        confirm_destructive_action "This performs a destructive full-device burn-in." "$device_path"
+      fi
+      if [[ "$LOG_ENABLED" -eq 1 ]]; then
+        run_logged_command "$log_file" badblocks -o "$log_dir/badblocks.txt" "$device_path"
+        run_logged_command "$log_file" fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename="$device_path" --output="$log_dir/fio.log"
+      else
+        run_logged_command "$log_file" badblocks "$device_path"
+        run_logged_command "$log_file" fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename="$device_path"
+      fi
       run_logged_command "$log_file" smartctl --health "$device_path"
       ;;
     discard)
@@ -1083,8 +1117,10 @@ run_drive() {
   ok "==> Drive operation completed"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     ok "==> No logs were written because this was a dry run"
-  else
+  elif [[ "$LOG_ENABLED" -eq 1 ]]; then
     ok "==> Logs saved in $log_dir"
+  else
+    ok "==> Logging was not enabled"
   fi
 }
 
