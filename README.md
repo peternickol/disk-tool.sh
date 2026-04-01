@@ -49,6 +49,22 @@ This project currently targets:
 
 The setup flow assumes `apt-get` and Debian/Ubuntu package names.
 
+## Quick Install
+
+Download and install from the public repository:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool -o disk-tool
+chmod +x disk-tool
+sudo ./disk-tool --install
+```
+
+Quick update:
+
+```bash
+disk-tool --update
+```
+
 ## Command Summary
 
 ```text
@@ -173,20 +189,12 @@ https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool
 
 You can still override that with `DISK_TOOL_RAW_URL` if needed.
 
-## GitHub Install Examples
+## Public Update Source
 
-Example raw install pattern:
+`disk-tool --update` uses this public raw script URL by default:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool -o disk-tool
-chmod +x disk-tool
-sudo ./disk-tool --install
-```
-
-Example raw update pattern:
-
-```bash
-disk-tool --update
+```text
+https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool
 ```
 
 Optional override:
