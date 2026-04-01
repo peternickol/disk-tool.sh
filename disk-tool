@@ -43,6 +43,7 @@ fi
 log()  { printf '%s%s%s\n' "$C_INFO" "$*" "$C_RESET"; }
 ok()   { printf '%s%s%s\n' "$C_OK" "$*" "$C_RESET"; }
 warn() { printf '%s%s%s\n' "$C_WARN" "$*" "$C_RESET"; }
+log_err() { printf '%s%s%s\n' "$C_INFO" "$*" "$C_RESET" >&2; }
 die()  { printf '%s%s%s\n' "$C_ERR" "$*" "$C_RESET" >&2; exit 1; }
 die_code() { local code="$1"; shift; printf '%s%s%s\n' "$C_ERR" "$*" "$C_RESET" >&2; exit "$code"; }
 
@@ -466,7 +467,7 @@ download_remote_script() {
 
   temp_script="$(mktemp "${TMPDIR:-/tmp}/${TOOL_NAME}-download.XXXXXX")"
 
-  log "==> Downloading latest $TOOL_NAME from $REPO_RAW_URL"
+  log_err "==> Downloading latest $TOOL_NAME from $REPO_RAW_URL"
   curl -fsSL "$REPO_RAW_URL" -o "$temp_script"
 
   if [[ ! -s "$temp_script" ]]; then
