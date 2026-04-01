@@ -601,7 +601,25 @@ run_dd() {
 list_available_disks() {
   log "Available disks:"
   if command -v lsblk >/dev/null 2>&1; then
-    lsblk -dn -o PATH,SIZE,TYPE,TRAN,RM,ROTA,MODEL,SERIAL | awk '$3 == "disk" { print }'
+    lsblk -Pdn -o PATH,SIZE,TYPE,TRAN,RM,ROTA,MODEL,SERIAL | \
+      awk '
+        BEGIN {
+          printf "%-16s %-8s %-6s %-3s %-4s %-24s %s\n", "PATH", "SIZE", "TRAN", "RM", "ROTA", "MODEL", "SERIAL"
+        }
+        /TYPE="disk"/ {
+          path=field("PATH"); size=field("SIZE"); tran=field("TRAN"); rm=field("RM");
+          rota=field("ROTA"); model=field("MODEL"); serial=field("SERIAL");
+          printf "%-16s %-8s %-6s %-3s %-4s %-24s %s\n", path, size, tran, rm, rota, model, serial
+        }
+        function field(name,    pattern, value) {
+          pattern = name "=\"[^\"]*\""
+          if (match($0, pattern)) {
+            value = substr($0, RSTART + length(name) + 2, RLENGTH - length(name) - 3)
+            return value
+          }
+          return ""
+        }
+      '
   else
     warn "lsblk not available"
   fi
@@ -610,7 +628,27 @@ list_available_disks() {
 list_removable_disks() {
   log "Likely removable disks:"
   if command -v lsblk >/dev/null 2>&1; then
-    lsblk -dn -o PATH,SIZE,TYPE,TRAN,RM,ROTA,MODEL,SERIAL | awk '$3 == "disk" && ($4 == "usb" || $5 == "1" || $1 ~ /mmcblk/) { print }'
+    lsblk -Pdn -o PATH,SIZE,TYPE,TRAN,RM,ROTA,MODEL,SERIAL | \
+      awk '
+        BEGIN {
+          printf "%-16s %-8s %-6s %-3s %-4s %-24s %s\n", "PATH", "SIZE", "TRAN", "RM", "ROTA", "MODEL", "SERIAL"
+        }
+        /TYPE="disk"/ {
+          path=field("PATH"); size=field("SIZE"); tran=field("TRAN"); rm=field("RM");
+          rota=field("ROTA"); model=field("MODEL"); serial=field("SERIAL");
+          if (tran == "usb" || rm == "1" || path ~ /mmcblk/) {
+            printf "%-16s %-8s %-6s %-3s %-4s %-24s %s\n", path, size, tran, rm, rota, model, serial
+          }
+        }
+        function field(name,    pattern, value) {
+          pattern = name "=\"[^\"]*\""
+          if (match($0, pattern)) {
+            value = substr($0, RSTART + length(name) + 2, RLENGTH - length(name) - 3)
+            return value
+          }
+          return ""
+        }
+      '
   else
     warn "lsblk not available"
   fi
