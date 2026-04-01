@@ -17,10 +17,8 @@ REPO_RAW_URL="${DISK_TOOL_RAW_URL:-}"
 INSTALL_FORCE=0
 AUTO_YES=0
 NO_COMPLETION=0
-OUTPUT_JSON=0
 DRY_RUN=0
 DD_VERIFY=0
-LOG_ROOT_DIR="${DISK_TOOL_LOG_DIR:-$PWD/disk-tool-logs}"
 
 EXIT_USAGE=2
 EXIT_DEPENDENCY=3
@@ -74,7 +72,6 @@ Setup:
 General:
   -y, --yes                  Skip destructive confirmation prompts
   --dry-run                  Show destructive commands without executing them
-  --json                     Emit JSON for safe informational commands
   --help                     Show this help text
   --version                  Show version information
   --no-completion            Skip bash completion install during --setup/--install
@@ -145,6 +142,9 @@ require_bin() {
 }
 
 require_root() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
   if [[ "$(id -u)" -ne 0 ]]; then
     die "This command requires sudo/root permissions"
   fi
@@ -161,9 +161,6 @@ parse_all_flags() {
         ;;
       --no-completion)
         NO_COMPLETION=1
-        ;;
-      --json)
-        OUTPUT_JSON=1
         ;;
       --dry-run)
         DRY_RUN=1
@@ -197,10 +194,6 @@ parse_leading_flags() {
         NO_COMPLETION=1
         shift
         ;;
-      --json)
-        OUTPUT_JSON=1
-        shift
-        ;;
       --dry-run)
         DRY_RUN=1
         shift
@@ -216,22 +209,6 @@ parse_leading_flags() {
     esac
   done
   REMAINING_ARGS=()
-}
-
-json_escape() {
-  local s="${1-}"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "$s"
-}
-
-json_key_value() {
-  local key="$1"
-  local value="$2"
-  printf '"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$value")"
 }
 
 run_or_echo() {
@@ -265,6 +242,18 @@ target_user_shell() {
     printf '%s' "${SHELL:-/bin/bash}"
   fi
 }
+
+runtime_log_root() {
+  local user_home
+  user_home="$(target_user_home)"
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    printf '%s' "${XDG_STATE_HOME%/}/disk-tool"
+  else
+    printf '%s' "$user_home/.local/state/disk-tool"
+  fi
+}
+
+LOG_ROOT_DIR="${DISK_TOOL_LOG_DIR:-$(runtime_log_root)}"
 
 shell_rc_path() {
   local user_home user_shell shell_name
@@ -309,7 +298,7 @@ _disk_tool_completions() {
   case "${words[1]}" in
     drive)
       if [[ $cword -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "$drive_modes --help help -h" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$devices --help help -h" -- "$cur") )
       elif [[ $cword -eq 3 ]]; then
         COMPREPLY=( $(compgen -W "$drive_modes" -- "$cur") )
       fi
@@ -363,14 +352,6 @@ image_file_info() {
     type="$(file -b "$file_path")"
   else
     type="unknown"
-  fi
-
-  if [[ "$OUTPUT_JSON" -eq 1 ]]; then
-    printf '{%s,%s,%s}\n' \
-      "$(json_key_value "path" "$file_path")" \
-      "$(json_key_value "size_bytes" "$size")" \
-      "$(json_key_value "sha256" "$sha"),$(json_key_value "type" "$type")"
-    return 0
   fi
 
   log "==> Image file"
@@ -559,6 +540,7 @@ run_doctor() {
 run_dd() {
   local input_path="$1"
   local output_path="$2"
+  local source_size
 
   require_root
   require_bin dd
@@ -591,11 +573,30 @@ run_dd() {
   show_path_summary "$output_path"
   echo
   warn "If the target is the wrong disk or file, its contents may be permanently destroyed."
-  echo -n "Press [ENTER] to continue or Ctrl+C to exit..."
-  read -r _
+  confirm_target_path "$output_path"
 
   log "==> Duplicating image from $input_path to $output_path"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    warn "DRY-RUN: dd if=\"$input_path\" of=\"$output_path\" bs=4M iflag=fullblock status=progress conv=fsync"
+    if [[ "$DD_VERIFY" -eq 1 ]]; then
+      warn "DRY-RUN: cmp -n <source_size> \"$input_path\" \"$output_path\""
+    fi
+    return 0
+  fi
+
   dd if="$input_path" of="$output_path" bs=4M iflag=fullblock status=progress conv=fsync
+
+  if [[ "$DD_VERIFY" -eq 1 ]]; then
+    require_bin cmp
+    if [[ -f "$input_path" ]]; then
+      source_size="$(stat -c%s "$input_path")"
+      log "==> Verifying written output"
+      cmp -n "$source_size" "$input_path" "$output_path"
+      ok "==> Verification passed"
+    else
+      warn "Verification skipped because SOURCE is not a regular file."
+    fi
+  fi
 
   ok "==> Done"
 }
@@ -638,6 +639,10 @@ require_unmounted_target() {
   local action_label="$2"
 
   if device_exists "$target_path" && has_mounted_children "$target_path"; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      warn "DRY-RUN: $action_label would refuse this mounted target device."
+      return 0
+    fi
     printf '%s%s%s\n' "$C_ERR_BG" "REFUSING TO TOUCH A MOUNTED DEVICE." "$C_RESET" >&2
     warn "$action_label requires an unmounted target device." >&2
     show_path_summary "$target_path" >&2
@@ -652,6 +657,11 @@ require_unmounted_target() {
 confirm_target_path() {
   local target_path="$1"
   local typed_path
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    warn "DRY-RUN: skipping manual confirmation for $target_path"
+    return 0
+  fi
 
   if [[ "$AUTO_YES" -eq 1 ]]; then
     warn "Skipping manual confirmation because --yes was provided."
@@ -705,6 +715,11 @@ run_logged_command() {
   local log_file="$1"
   shift
 
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    warn "DRY-RUN: $*"
+    return 0
+  fi
+
   if "$@" > >(tee -a "$log_file") 2> >(tee -a "$log_file" >&2); then
     return 0
   fi
@@ -712,6 +727,15 @@ run_logged_command() {
   local cmd_status=$?
   printf '%s\n' "Command failed with exit code $cmd_status: $*" | tee -a "$log_file" >&2
   exit "$cmd_status"
+}
+
+capture_to_log() {
+  local log_file="$1"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    cat
+  else
+    tee -a "$log_file"
+  fi
 }
 
 show_fdisk_overview() {
@@ -723,6 +747,10 @@ show_fdisk_overview() {
 
 show_device_identity() {
   local device_path="$1"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    lsblk -dn -o PATH,MODEL,SERIAL | awk -v p="$device_path" '$1 == p { print }' || true
+    return 0
+  fi
   if [[ "$device_path" == /dev/nvme* ]]; then
     require_bin nvme
     nvme id-ctrl "$device_path" | grep -E 'mn|sn' || true
@@ -801,8 +829,10 @@ run_benchmark() {
 
   device_slug="$(basename -- "$device_path")"
   log_dir="$(drive_log_dir "$device_slug")"
-  mkdir -p "$log_dir"
   log_file="$log_dir/benchmark.log"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$log_dir"
+  fi
 
   warn "This is a read-only benchmark, but it can heavily load the selected device."
   show_path_summary "$device_path"
@@ -812,7 +842,11 @@ run_benchmark() {
 
   run_logged_command "$log_file" fio --name=read-benchmark --filename="$device_path" --rw=read --direct=1 --bs=1M --iodepth=16 --time_based=1 --runtime=30 --group_reporting=1
   ok "==> Benchmark completed"
-  ok "==> Logs saved in $log_dir"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    ok "==> No logs were written because this was a dry run"
+  else
+    ok "==> Logs saved in $log_dir"
+  fi
 }
 
 run_drive() {
@@ -849,13 +883,17 @@ run_drive() {
 
   device_slug="$(basename -- "$device_path")"
   log_dir="$(drive_log_dir "$device_slug")"
-  mkdir -p "$log_dir"
   log_file="$log_dir/${mode}.log"
-  log "==> Logging to $log_file"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "==> Dry run log path would be $log_file"
+  else
+    mkdir -p "$log_dir"
+    log "==> Logging to $log_file"
+  fi
 
   case "$mode" in
     serial)
-      show_device_identity "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
       ;;
     smart)
       require_bin smartctl
@@ -866,8 +904,8 @@ run_drive() {
     test)
       require_bin badblocks
       require_unmounted_target "$device_path" "disk-tool drive test"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command about to be run:"
       echo "  /usr/bin/time --verbose badblocks -wvs $device_path"
@@ -878,8 +916,8 @@ run_drive() {
     wipe)
       require_bin shred
       require_unmounted_target "$device_path" "disk-tool drive wipe"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command about to be run:"
       echo "  /usr/bin/time --verbose shred --verbose --iterations=1 $device_path"
@@ -893,8 +931,8 @@ run_drive() {
       require_bin wipefs
       require_bin blockdev
       require_unmounted_target "$device_path" "disk-tool drive quick-wipe"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command sequence about to be run:"
       echo "  wipefs -a $device_path"
@@ -904,17 +942,21 @@ run_drive() {
       confirm_destructive_action "This removes signatures and zeros the beginning and end of the device." "$device_path"
       run_logged_command "$log_file" wipefs -a "$device_path"
       run_logged_command "$log_file" dd if=/dev/zero of="$device_path" bs=1M count=16 conv=fsync status=progress
-      size_bytes="$(blockdev --getsize64 "$device_path")"
-      if [[ "$size_bytes" -gt 16777216 ]]; then
-        seek_mib=$(( size_bytes / 1048576 - 16 ))
-        run_logged_command "$log_file" dd if=/dev/zero of="$device_path" bs=1M seek="$seek_mib" count=16 conv=fsync status=progress
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        warn "DRY-RUN: dd if=/dev/zero of=$device_path bs=1M seek=<last-16MiB> count=16 conv=fsync status=progress"
+      else
+        size_bytes="$(blockdev --getsize64 "$device_path")"
+        if [[ "$size_bytes" -gt 16777216 ]]; then
+          seek_mib=$(( size_bytes / 1048576 - 16 ))
+          run_logged_command "$log_file" dd if=/dev/zero of="$device_path" bs=1M seek="$seek_mib" count=16 conv=fsync status=progress
+        fi
       fi
       ;;
     full-wipe)
       require_bin shred
       require_unmounted_target "$device_path" "disk-tool drive full-wipe"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command about to be run:"
       echo "  /usr/bin/time --verbose shred --verbose --iterations=7 --zero $device_path"
@@ -927,8 +969,8 @@ run_drive() {
       require_bin fio
       require_bin smartctl
       require_unmounted_target "$device_path" "disk-tool drive burnin"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command sequence about to be run:"
       echo "  badblocks -o $log_dir/badblocks.txt $device_path"
@@ -943,8 +985,8 @@ run_drive() {
     discard)
       require_bin blkdiscard
       require_unmounted_target "$device_path" "disk-tool drive discard"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command about to be run:"
       echo "  blkdiscard -f $device_path"
@@ -958,8 +1000,8 @@ run_drive() {
       if [[ "$device_path" == /dev/nvme* ]]; then
         die "ATA erase is not valid for NVMe devices: $device_path"
       fi
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command sequence about to be run:"
       echo "  hdparm --security-set-pass NULL $device_path"
@@ -975,8 +1017,8 @@ run_drive() {
       if [[ "$device_path" != /dev/nvme* ]]; then
         die "NVMe erase is only valid for NVMe devices: $device_path"
       fi
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command about to be run:"
       echo "  nvme format $device_path --ses=1"
@@ -987,8 +1029,8 @@ run_drive() {
     shred-erase)
       require_bin shred
       require_unmounted_target "$device_path" "disk-tool drive shred-erase"
-      show_device_identity "$device_path" | tee -a "$log_file"
-      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      show_device_identity "$device_path" | capture_to_log "$log_file"
+      show_fdisk_overview "$device_path" | capture_to_log "$log_file"
       echo
       warn "Command about to be run:"
       echo "  /usr/bin/time --verbose shred --verbose -z -n 3 $device_path"
@@ -1004,7 +1046,11 @@ run_drive() {
   esac
 
   ok "==> Drive operation completed"
-  ok "==> Logs saved in $log_dir"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    ok "==> No logs were written because this was a dry run"
+  else
+    ok "==> Logs saved in $log_dir"
+  fi
 }
 
 case "$SUBCOMMAND" in
@@ -1047,16 +1093,43 @@ case "$SUBCOMMAND" in
     parse_leading_flags "$@"
     set -- "${REMAINING_ARGS[@]}"
     if [[ $# -ne 1 ]]; then
-      die "disk-tool info requires DEVICE"
+      die_code "$EXIT_USAGE" "disk-tool info requires DEVICE"
     fi
     run_info "$1"
+    ;;
+  image-info)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    if [[ $# -ne 1 ]]; then
+      die_code "$EXIT_USAGE" "disk-tool image-info requires FILE"
+    fi
+    image_file_info "$1"
+    ;;
+  hash)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    if [[ $# -ne 1 ]]; then
+      die_code "$EXIT_USAGE" "disk-tool hash requires FILE"
+    fi
+    run_hash "$1"
+    ;;
+  verify)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    if [[ $# -ne 2 ]]; then
+      die_code "$EXIT_USAGE" "disk-tool verify requires FILE and SHA256"
+    fi
+    run_verify_hash "$1" "$2"
     ;;
   benchmark)
     shift
     parse_leading_flags "$@"
     set -- "${REMAINING_ARGS[@]}"
     if [[ $# -ne 1 ]]; then
-      die "disk-tool benchmark requires DEVICE"
+      die_code "$EXIT_USAGE" "disk-tool benchmark requires DEVICE"
     fi
     run_benchmark "$1"
     ;;

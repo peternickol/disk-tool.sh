@@ -1,5 +1,12 @@
 # disk-tool
 
+## TESTING STATUS
+
+`disk-tool` is still in testing and should not be relied on for production use.
+
+Treat every command as experimental, verify everything yourself, and do not use
+it on hardware or data you are not prepared to lose.
+
 ## WARNING
 
 `disk-tool` can permanently destroy data, erase entire drives, overwrite the
@@ -29,6 +36,7 @@ It is designed as a single portable command with:
 - a simple public CLI
 - strong destructive-operation warnings
 - timestamped per-device logs
+- file hashing and image inspection helpers
 - install and update helpers
 - bash completion support
 
@@ -44,7 +52,7 @@ The setup flow assumes `apt-get` and Debian/Ubuntu package names.
 ## Command Summary
 
 ```text
-disk-tool --setup
+disk-tool --setup [--no-completion]
 disk-tool --install [--force] [--no-completion]
 disk-tool --update [--force]
 disk-tool --help
@@ -54,6 +62,9 @@ disk-tool doctor
 disk-tool list
 disk-tool removable
 disk-tool info DEVICE
+disk-tool image-info FILE
+disk-tool hash FILE
+disk-tool verify FILE SHA256
 disk-tool benchmark DEVICE
 disk-tool dd SOURCE TARGET
 disk-tool drive
@@ -86,6 +97,7 @@ Safety behaviors:
 - destructive commands require typing the exact target path unless `--yes` is used
 - destructive commands refuse mounted target devices by default
 - `--force` can override the mounted-device refusal
+- `--dry-run` prints the command or command sequence that would run without executing it
 
 `--yes` is intended for trusted automation or experienced use. It should be used
 carefully.
@@ -154,20 +166,6 @@ export DISK_TOOL_RAW_URL="https://raw.githubusercontent.com/OWNER/REPO/main/disk
 disk-tool --update
 ```
 
-### Bash completion
-
-Print the bash completion script:
-
-```bash
-disk-tool completion bash
-```
-
-Install bash completion:
-
-```bash
-disk-tool completion install
-```
-
 ## GitHub-Friendly Install Examples
 
 Example raw install pattern:
@@ -186,6 +184,20 @@ disk-tool --update
 ```
 
 Replace `OWNER/REPO` with the actual GitHub repository path.
+
+## Bash Completion
+
+Print the bash completion script:
+
+```bash
+disk-tool completion bash
+```
+
+Install bash completion:
+
+```bash
+disk-tool completion install
+```
 
 ## Command Reference
 
@@ -255,6 +267,43 @@ Example:
 disk-tool info /dev/nvme0n1
 ```
 
+### `disk-tool image-info FILE`
+
+Shows a non-destructive summary of an image file.
+
+It includes:
+
+- file path
+- size in bytes
+- detected file type when `file` is available
+- SHA-256 hash
+
+Example:
+
+```bash
+disk-tool image-info ./debian.iso
+```
+
+### `disk-tool hash FILE`
+
+Prints the SHA-256 hash for a file.
+
+Example:
+
+```bash
+disk-tool hash ./debian.iso
+```
+
+### `disk-tool verify FILE SHA256`
+
+Verifies a file against an expected SHA-256 value.
+
+Example:
+
+```bash
+disk-tool verify ./debian.iso <sha256>
+```
+
 ### `disk-tool benchmark DEVICE`
 
 Runs a read-only benchmark against a block device using `fio`.
@@ -288,11 +337,14 @@ Notes:
 - `TARGET` should be a full device path such as `/dev/sda` or `/dev/nvme0n1`
 - mounted targets are refused unless `--force` is used
 - destructive confirmation requires the exact target path unless `--yes` is used
+- `--dry-run` prints the write and verify commands without executing them
+- `--verify` compares the written output against the source file after writing when `SOURCE` is a regular file
 
 Example:
 
 ```bash
 sudo disk-tool dd ~/Downloads/debian.iso /dev/sda
+sudo disk-tool dd --verify ~/Downloads/debian.iso /dev/sda
 ```
 
 ### `disk-tool drive`
@@ -535,13 +587,13 @@ Drive and benchmark operations create timestamped log directories automatically.
 Default log location:
 
 ```text
-./disk-tool-logs
+$HOME/.local/state/disk-tool
 ```
 
 Example structure:
 
 ```text
-disk-tool-logs/
+$HOME/.local/state/disk-tool/
   sda/
     20260331-184500/
       smart.log
@@ -606,11 +658,14 @@ sudo disk-tool drive /dev/nvme0n1 nvme-erase
 `disk-tool` currently uses these main exit codes:
 
 - `0` success
-- `1` general error, invalid arguments, missing device, unsupported mode, or canceled confirmation
+- `1` general error
+- `2` usage error or invalid arguments
+- `3` missing dependency
+- `4` missing or invalid device
+- `5` mounted target refused
+- `6` destructive confirmation failed
+- `7` underlying command failure
 
-More specialized non-zero exit codes can be added later, but today the tool is
-primarily oriented around readable terminal messages rather than a large exit
-code matrix.
 
 ## Troubleshooting
 
