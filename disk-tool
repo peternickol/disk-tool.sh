@@ -465,7 +465,6 @@ download_remote_script() {
   require_bin curl
 
   temp_script="$(mktemp "${TMPDIR:-/tmp}/${TOOL_NAME}-download.XXXXXX")"
-  trap 'rm -f "$temp_script"' RETURN
 
   log "==> Downloading latest $TOOL_NAME from $REPO_RAW_URL"
   curl -fsSL "$REPO_RAW_URL" -o "$temp_script"
@@ -480,7 +479,10 @@ download_remote_script() {
 install_from_remote() {
   local temp_script
   temp_script="$(download_remote_script)"
+  trap 'rm -f "$temp_script"' RETURN
   install_launcher_from_file "$temp_script"
+  trap - RETURN
+  rm -f "$temp_script"
 }
 
 is_debian_like() {
