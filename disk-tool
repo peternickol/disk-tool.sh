@@ -1,0 +1,1127 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+  LINK_DIR="$(cd -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink -- "$SOURCE_PATH")"
+  [[ "$SOURCE_PATH" != /* ]] && SOURCE_PATH="$LINK_DIR/$SOURCE_PATH"
+done
+SCRIPT_PATH="$(cd -- "$(dirname -- "$SOURCE_PATH")" && pwd)/$(basename -- "$SOURCE_PATH")"
+
+VERSION="0.1.0"
+TOOL_NAME="disk-tool"
+SUBCOMMAND="${1:-help}"
+
+REPO_RAW_URL="${DISK_TOOL_RAW_URL:-}"
+INSTALL_FORCE=0
+AUTO_YES=0
+NO_COMPLETION=0
+OUTPUT_JSON=0
+DRY_RUN=0
+DD_VERIFY=0
+LOG_ROOT_DIR="${DISK_TOOL_LOG_DIR:-$PWD/disk-tool-logs}"
+
+EXIT_USAGE=2
+EXIT_DEPENDENCY=3
+EXIT_DEVICE=4
+EXIT_MOUNTED=5
+EXIT_CONFIRM=6
+EXIT_COMMAND=7
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\e[0m'
+  C_INFO=$'\e[36m'
+  C_OK=$'\e[32m'
+  C_WARN=$'\e[33m'
+  C_ERR=$'\e[31m'
+  C_ERR_BG=$'\e[1;41m'
+else
+  C_RESET="" C_INFO="" C_OK="" C_WARN="" C_ERR="" C_ERR_BG=""
+fi
+
+log()  { printf '%s%s%s\n' "$C_INFO" "$*" "$C_RESET"; }
+ok()   { printf '%s%s%s\n' "$C_OK" "$*" "$C_RESET"; }
+warn() { printf '%s%s%s\n' "$C_WARN" "$*" "$C_RESET"; }
+die()  { printf '%s%s%s\n' "$C_ERR" "$*" "$C_RESET" >&2; exit 1; }
+die_code() { local code="$1"; shift; printf '%s%s%s\n' "$C_ERR" "$*" "$C_RESET" >&2; exit "$code"; }
+
+usage() {
+  cat <<EOF
+Usage: disk-tool <command> [options]
+       disk-tool --setup [--no-completion]
+       disk-tool --install [--force] [--no-completion]
+       disk-tool --update [--force]
+
+Commands:
+  dd SOURCE TARGET          Write an image to a block device with progress output
+  list                       List available disks with transport and model details
+  removable                  List likely removable disks such as USB or MMC media
+  info DEVICE                Show a detailed non-destructive device summary
+  image-info FILE            Show details about an image file
+  hash FILE                  Print SHA-256 for a file
+  verify FILE SHA256         Verify a file against a SHA-256 value
+  benchmark DEVICE           Run a read-only benchmark against a device
+  drive DEVICE MODE         Manage a drive: serial, smart, test, wipe, or full-wipe
+  completion ACTION         Print or install bash completion support
+  doctor                     Show environment details for troubleshooting
+
+Setup:
+  --setup                    Install prerequisites, launcher, and bash completion
+  --install                  Install the launcher from this local script
+  --update                   Reinstall from this local script or remote URL
+
+General:
+  -y, --yes                  Skip destructive confirmation prompts
+  --dry-run                  Show destructive commands without executing them
+  --json                     Emit JSON for safe informational commands
+  --help                     Show this help text
+  --version                  Show version information
+  --no-completion            Skip bash completion install during --setup/--install
+  --verify                   After dd, verify written output against the source file
+
+Environment:
+  DISK_TOOL_RAW_URL          Optional raw script URL for curl-based installs/updates
+EOF
+}
+
+dd_usage() {
+  cat <<EOF
+Usage: disk-tool dd SOURCE TARGET
+
+Write SOURCE to TARGET using \`dd\` with progress output and a final fsync.
+
+Examples:
+  sudo disk-tool dd ~/Downloads/linux.iso /dev/sda
+  sudo disk-tool dd --verify ~/Downloads/linux.iso /dev/sda
+EOF
+}
+
+drive_usage() {
+  cat <<EOF
+Usage: disk-tool drive
+       disk-tool drive DEVICE MODE
+
+Modes:
+  serial                    Show model and serial number
+  smart                     Show SMART information and health data
+  test                      Run destructive badblocks write test
+  wipe                      Run single-pass shred wipe
+  quick-wipe                Wipe signatures and zero the start/end of the device
+  full-wipe                 Run 7-pass shred wipe followed by zeroing
+  burnin                    Run destructive badblocks, fio, and SMART validation
+  discard                   Run blkdiscard on supported SSD/NVMe devices
+  ata-erase                 Run ATA secure erase on SATA/SAS-style disks
+  nvme-erase                Run NVMe format secure erase
+  shred-erase               Run 3-pass shred erase
+
+Examples:
+  sudo disk-tool drive /dev/sda serial
+  sudo disk-tool drive /dev/sdb smart
+  sudo disk-tool drive /dev/sdc test
+  sudo disk-tool drive /dev/sdc burnin
+  sudo disk-tool drive /dev/sdd quick-wipe
+  sudo disk-tool drive /dev/sdd ata-erase
+  sudo disk-tool drive /dev/nvme0n1 nvme-erase
+EOF
+}
+
+completion_usage() {
+  cat <<EOF
+Usage: disk-tool completion bash
+       disk-tool completion install
+
+Actions:
+  bash                      Print bash completion script to stdout
+  install                   Install bash completion for the current user or system
+EOF
+}
+
+require_bin() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    die_code "$EXIT_DEPENDENCY" "Required command not found: $name"
+  fi
+}
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    die "This command requires sudo/root permissions"
+  fi
+}
+
+parse_all_flags() {
+  while (($# > 0)); do
+    case "$1" in
+      --force)
+        INSTALL_FORCE=1
+        ;;
+      -y|--yes)
+        AUTO_YES=1
+        ;;
+      --no-completion)
+        NO_COMPLETION=1
+        ;;
+      --json)
+        OUTPUT_JSON=1
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --verify)
+        DD_VERIFY=1
+        ;;
+      *)
+        printf '%sUnknown option: %s%s\n' "$C_ERR" "$1" "$C_RESET" >&2
+        usage >&2
+        exit "$EXIT_USAGE"
+        ;;
+    esac
+    shift
+  done
+}
+
+parse_leading_flags() {
+  REMAINING_ARGS=()
+  while (($# > 0)); do
+    case "$1" in
+      --force)
+        INSTALL_FORCE=1
+        shift
+        ;;
+      -y|--yes)
+        AUTO_YES=1
+        shift
+        ;;
+      --no-completion)
+        NO_COMPLETION=1
+        shift
+        ;;
+      --json)
+        OUTPUT_JSON=1
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --verify)
+        DD_VERIFY=1
+        shift
+        ;;
+      *)
+        REMAINING_ARGS=("$@")
+        return 0
+        ;;
+    esac
+  done
+  REMAINING_ARGS=()
+}
+
+json_escape() {
+  local s="${1-}"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+json_key_value() {
+  local key="$1"
+  local value="$2"
+  printf '"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$value")"
+}
+
+run_or_echo() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    warn "DRY-RUN: $*"
+    return 0
+  fi
+  "$@"
+}
+
+launcher_target() {
+  if [[ -w /usr/local/bin ]]; then
+    printf '%s' "/usr/local/bin/$TOOL_NAME"
+  else
+    printf '%s' "$HOME/.local/bin/$TOOL_NAME"
+  fi
+}
+
+target_user_home() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    getent passwd "$SUDO_USER" | cut -d: -f6
+  else
+    printf '%s' "$HOME"
+  fi
+}
+
+target_user_shell() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    getent passwd "$SUDO_USER" | cut -d: -f7
+  else
+    printf '%s' "${SHELL:-/bin/bash}"
+  fi
+}
+
+shell_rc_path() {
+  local user_home user_shell shell_name
+  user_home="$(target_user_home)"
+  user_shell="$(target_user_shell)"
+  shell_name="$(basename -- "$user_shell")"
+
+  if [[ "$shell_name" == "bash" ]]; then
+    printf '%s' "$user_home/.bashrc"
+  elif [[ "$shell_name" == "zsh" ]]; then
+    printf '%s' "$user_home/.zshrc"
+  else
+    printf '%s' "$user_home/.profile"
+  fi
+}
+
+completion_target() {
+  if [[ -w /etc/bash_completion.d ]]; then
+    printf '%s' "/etc/bash_completion.d/$TOOL_NAME"
+  else
+    printf '%s' "$HOME/.local/share/bash-completion/completions/$TOOL_NAME"
+  fi
+}
+
+print_bash_completion() {
+  cat <<'EOF'
+_disk_tool_completions() {
+  local cur prev words cword
+  _init_completion || return
+
+  local commands="dd list removable info image-info hash verify benchmark drive completion doctor help --help version --version --setup --install --update"
+  local drive_modes="serial smart test wipe quick-wipe full-wipe burnin discard ata-erase nvme-erase shred-erase"
+  local completion_actions="bash install"
+  local devices
+  devices="$(lsblk -dn -o PATH 2>/dev/null)"
+
+  if [[ $cword -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+    return
+  fi
+
+  case "${words[1]}" in
+    drive)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$drive_modes --help help -h" -- "$cur") )
+      elif [[ $cword -eq 3 ]]; then
+        COMPREPLY=( $(compgen -W "$drive_modes" -- "$cur") )
+      fi
+      ;;
+    info|benchmark)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$devices" -- "$cur") )
+      fi
+      ;;
+    dd)
+      if [[ $cword -eq 3 ]]; then
+        COMPREPLY=( $(compgen -W "$devices" -- "$cur") )
+      fi
+      ;;
+    completion)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$completion_actions" -- "$cur") )
+      fi
+      ;;
+  esac
+}
+
+complete -F _disk_tool_completions disk-tool
+EOF
+}
+
+install_completion() {
+  local target target_dir staged_completion
+  target="$(completion_target)"
+  target_dir="$(dirname -- "$target")"
+  mkdir -p "$target_dir"
+  staged_completion="$(mktemp "${TMPDIR:-/tmp}/${TOOL_NAME}-completion.XXXXXX")"
+  trap 'rm -f "$staged_completion"' RETURN
+  print_bash_completion > "$staged_completion"
+  install -m 0644 "$staged_completion" "$target"
+  trap - RETURN
+  rm -f "$staged_completion"
+  ok "==> Installed bash completion: $target"
+}
+
+image_file_info() {
+  local file_path="$1"
+  local size sha type
+
+  [[ -n "$file_path" ]] || die "disk-tool image-info requires FILE"
+  [[ -f "$file_path" ]] || die_code "$EXIT_USAGE" "File not found: $file_path"
+
+  size="$(stat -c%s "$file_path" 2>/dev/null || wc -c < "$file_path")"
+  sha="$(sha256sum "$file_path" | awk '{print $1}')"
+  if command -v file >/dev/null 2>&1; then
+    type="$(file -b "$file_path")"
+  else
+    type="unknown"
+  fi
+
+  if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+    printf '{%s,%s,%s}\n' \
+      "$(json_key_value "path" "$file_path")" \
+      "$(json_key_value "size_bytes" "$size")" \
+      "$(json_key_value "sha256" "$sha"),$(json_key_value "type" "$type")"
+    return 0
+  fi
+
+  log "==> Image file"
+  printf 'path=%s\nsize_bytes=%s\ntype=%s\nsha256=%s\n' "$file_path" "$size" "$type" "$sha"
+}
+
+run_hash() {
+  local file_path="$1"
+  [[ -n "$file_path" ]] || die_code "$EXIT_USAGE" "disk-tool hash requires FILE"
+  [[ -f "$file_path" ]] || die_code "$EXIT_USAGE" "File not found: $file_path"
+  sha256sum "$file_path"
+}
+
+run_verify_hash() {
+  local file_path="$1"
+  local expected="$2"
+  local actual
+
+  [[ -n "$file_path" && -n "$expected" ]] || die_code "$EXIT_USAGE" "disk-tool verify requires FILE and SHA256"
+  [[ -f "$file_path" ]] || die_code "$EXIT_USAGE" "File not found: $file_path"
+  actual="$(sha256sum "$file_path" | awk '{print $1}')"
+  if [[ "$actual" == "$expected" ]]; then
+    ok "Checksum verified: $actual"
+    return 0
+  fi
+  die_code "$EXIT_COMMAND" "Checksum mismatch. expected=$expected actual=$actual"
+}
+
+ensure_launcher_path() {
+  local target_dir rc_path export_line path_present=0
+  target_dir="$(dirname -- "$(launcher_target)")"
+
+  if [[ "$target_dir" == "/usr/local/bin" ]]; then
+    case ":$PATH:" in
+      *":$target_dir:"*)
+        echo "==> Launcher directory already on PATH in this shell: $target_dir"
+        ;;
+      *)
+        ok "==> Installed global launcher in $target_dir"
+        ;;
+    esac
+    return 0
+  fi
+
+  rc_path="$(shell_rc_path)"
+  export_line="export PATH=\"$target_dir:\$PATH\""
+
+  case ":$PATH:" in
+    *":$target_dir:"*)
+      path_present=1
+      ;;
+  esac
+
+  touch "$rc_path"
+  if grep -Fqx "$export_line" "$rc_path"; then
+    log "==> PATH export already present in $rc_path"
+  else
+    printf '\n# Added by %s setup\n%s\n' "$TOOL_NAME" "$export_line" >> "$rc_path"
+    ok "==> Added launcher PATH to $rc_path"
+  fi
+
+  if [[ $path_present -eq 1 ]]; then
+    echo "==> Launcher directory already on PATH in this shell: $target_dir"
+  else
+    warn "==> Open a new shell or run: source $rc_path"
+  fi
+}
+
+install_launcher_from_file() {
+  local source_file="$1"
+  local target target_dir staged_script
+
+  target="$(launcher_target)"
+  target_dir="$(dirname -- "$target")"
+
+  mkdir -p "$target_dir"
+  if [[ -L "$target" || -f "$target" ]]; then
+    if [[ "$INSTALL_FORCE" -ne 1 ]]; then
+      warn "==> Replacing existing launcher: $target"
+    fi
+    rm -f "$target"
+  fi
+
+  staged_script="$(mktemp "${TMPDIR:-/tmp}/${TOOL_NAME}.XXXXXX")"
+  trap 'rm -f "$staged_script"' RETURN
+  cp "$source_file" "$staged_script"
+  install -m 0755 "$staged_script" "$target"
+  trap - RETURN
+  rm -f "$staged_script"
+
+  ok "==> Installed launcher: $target"
+  ensure_launcher_path
+  if [[ "$NO_COMPLETION" -eq 0 ]]; then
+    install_completion
+  fi
+}
+
+download_remote_script() {
+  local temp_script
+
+  if [[ -z "$REPO_RAW_URL" ]]; then
+    die "Remote update URL not configured. Set DISK_TOOL_RAW_URL to a raw script URL."
+  fi
+
+  require_bin curl
+
+  temp_script="$(mktemp "${TMPDIR:-/tmp}/${TOOL_NAME}-download.XXXXXX")"
+  trap 'rm -f "$temp_script"' RETURN
+
+  log "==> Downloading latest $TOOL_NAME from $REPO_RAW_URL"
+  curl -fsSL "$REPO_RAW_URL" -o "$temp_script"
+
+  if [[ ! -s "$temp_script" ]]; then
+    die "Downloaded script is empty"
+  fi
+
+  printf '%s\n' "$temp_script"
+}
+
+install_from_remote() {
+  local temp_script
+  temp_script="$(download_remote_script)"
+  install_launcher_from_file "$temp_script"
+}
+
+is_debian_like() {
+  [[ -f /etc/debian_version ]]
+}
+
+setup_prereqs() {
+  local missing=()
+
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  command -v lsblk >/dev/null 2>&1 || missing+=("util-linux")
+  command -v df >/dev/null 2>&1 || missing+=("coreutils")
+  command -v pv >/dev/null 2>&1 || missing+=("pv")
+  command -v hdparm >/dev/null 2>&1 || missing+=("hdparm")
+  command -v smartctl >/dev/null 2>&1 || missing+=("smartmontools")
+  command -v badblocks >/dev/null 2>&1 || missing+=("e2fsprogs")
+  command -v shred >/dev/null 2>&1 || missing+=("coreutils")
+  command -v fio >/dev/null 2>&1 || missing+=("fio")
+  command -v nvme >/dev/null 2>&1 || missing+=("nvme-cli")
+  command -v wipefs >/dev/null 2>&1 || missing+=("util-linux")
+  command -v blkdiscard >/dev/null 2>&1 || missing+=("util-linux")
+  command -v blockdev >/dev/null 2>&1 || missing+=("util-linux")
+  [[ -x /usr/bin/time ]] || missing+=("time")
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    ok "==> All disk-tool prerequisites already installed"
+    install_launcher_from_file "$SCRIPT_PATH"
+    return 0
+  fi
+
+  if is_debian_like; then
+    log "==> Installing full disk-tool prerequisite set"
+    sudo apt-get update
+    sudo apt-get install -y curl util-linux coreutils pv hdparm smartmontools e2fsprogs fio nvme-cli time
+    install_launcher_from_file "$SCRIPT_PATH"
+    return 0
+  fi
+
+  die "Unsupported platform for --setup. This tool currently targets Debian/Ubuntu. Install prerequisites manually: ${missing[*]}"
+}
+
+run_doctor() {
+  local target rc_path
+  target="$(launcher_target)"
+  rc_path="$(shell_rc_path)"
+
+  echo "tool_name=$TOOL_NAME"
+  echo "version=$VERSION"
+  echo "script_path=$SCRIPT_PATH"
+  echo "launcher_target=$target"
+  echo "shell_rc=$rc_path"
+  echo "raw_url=${REPO_RAW_URL:-<unset>}"
+
+  for bin_name in bash curl lsblk df hdparm smartctl badblocks shred fio nvme wipefs blkdiscard blockdev; do
+    if command -v "$bin_name" >/dev/null 2>&1; then
+      echo "bin_$bin_name=$(command -v "$bin_name")"
+    else
+      echo "bin_$bin_name=<missing>"
+    fi
+  done
+}
+
+run_dd() {
+  local input_path="$1"
+  local output_path="$2"
+
+  require_root
+  require_bin dd
+
+  if [[ -z "$input_path" ]]; then
+    printf '%sError: No input specified%s\n' "$C_ERR" "$C_RESET" >&2
+    dd_usage >&2
+    exit 1
+  fi
+
+  if [[ -z "$output_path" ]]; then
+    printf '%sError: No output specified%s\n' "$C_ERR" "$C_RESET" >&2
+    dd_usage >&2
+    exit 1
+  fi
+
+  if [[ ! -e "$input_path" ]]; then
+    printf '%sInput not found: %s%s\n' "$C_ERR" "$input_path" "$C_RESET" >&2
+    exit 1
+  fi
+
+  require_unmounted_target "$output_path" "disk-tool dd"
+
+  echo
+  printf '%s%s%s\n' "$C_ERR_BG" "WARNING: THIS COMMAND WILL OVERWRITE THE TARGET PATH." "$C_RESET"
+  warn "Review the source and destination carefully before continuing."
+  echo
+  show_source_summary "$input_path"
+  echo
+  show_path_summary "$output_path"
+  echo
+  warn "If the target is the wrong disk or file, its contents may be permanently destroyed."
+  echo -n "Press [ENTER] to continue or Ctrl+C to exit..."
+  read -r _
+
+  log "==> Duplicating image from $input_path to $output_path"
+  dd if="$input_path" of="$output_path" bs=4M iflag=fullblock status=progress conv=fsync
+
+  ok "==> Done"
+}
+
+list_available_disks() {
+  log "Available disks:"
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -dn -o PATH,SIZE,TYPE,TRAN,RM,ROTA,MODEL,SERIAL | awk '$3 == "disk" { print }'
+  else
+    warn "lsblk not available"
+  fi
+}
+
+list_removable_disks() {
+  log "Likely removable disks:"
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -dn -o PATH,SIZE,TYPE,TRAN,RM,ROTA,MODEL,SERIAL | awk '$3 == "disk" && ($4 == "usb" || $5 == "1" || $1 ~ /mmcblk/) { print }'
+  else
+    warn "lsblk not available"
+  fi
+}
+
+device_exists() {
+  local target_path="$1"
+  lsblk -dn -o PATH | grep -Fx -- "$target_path" >/dev/null 2>&1
+}
+
+device_node_accessible() {
+  local target_path="$1"
+  [[ -e "$target_path" ]]
+}
+
+has_mounted_children() {
+  local target_path="$1"
+  lsblk -nr -o PATH,MOUNTPOINTS | awk -v p="$target_path" '$1 ~ "^" p && NF > 1 { found=1 } END { exit found ? 0 : 1 }'
+}
+
+require_unmounted_target() {
+  local target_path="$1"
+  local action_label="$2"
+
+  if device_exists "$target_path" && has_mounted_children "$target_path"; then
+    printf '%s%s%s\n' "$C_ERR_BG" "REFUSING TO TOUCH A MOUNTED DEVICE." "$C_RESET" >&2
+    warn "$action_label requires an unmounted target device." >&2
+    show_path_summary "$target_path" >&2
+    if [[ "$INSTALL_FORCE" -eq 1 ]]; then
+      warn "Continuing because --force was provided." >&2
+      return 0
+    fi
+    die_code "$EXIT_MOUNTED" "Unmount the target device or re-run with --force if you really mean it."
+  fi
+}
+
+confirm_target_path() {
+  local target_path="$1"
+  local typed_path
+
+  if [[ "$AUTO_YES" -eq 1 ]]; then
+    warn "Skipping manual confirmation because --yes was provided."
+    return 0
+  fi
+
+  printf 'Type the exact target path to continue: '
+  read -r typed_path
+  if [[ "$typed_path" != "$target_path" ]]; then
+    die_code "$EXIT_CONFIRM" "Confirmation failed. Expected: $target_path"
+  fi
+}
+
+show_path_summary() {
+  local target_path="$1"
+
+  if device_exists "$target_path"; then
+    echo "Target block device summary:"
+    lsblk -nr -o PATH,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS,TRAN,RM,ROTA,MODEL,SERIAL | awk -v p="$target_path" '$1 == p || $1 ~ "^" p "p?[0-9]+$" || $1 ~ "^" p "[0-9]+$" { print }' || true
+    echo
+    echo "Mounted children under target:"
+    lsblk -nr -o PATH,MOUNTPOINTS | awk -v p="$target_path" '$1 ~ "^" p && NF > 1 { print }' || true
+  elif [[ -e "$target_path" ]]; then
+    echo "Target file summary:"
+    ls -lh "$target_path" || true
+  else
+    echo "Target path does not currently exist: $target_path"
+  fi
+}
+
+show_source_summary() {
+  local input_path="$1"
+
+  if device_exists "$input_path"; then
+    echo "Source block device summary:"
+    lsblk -nr -o PATH,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS,TRAN,RM,ROTA,MODEL,SERIAL | awk -v p="$input_path" '$1 == p || $1 ~ "^" p "p?[0-9]+$" || $1 ~ "^" p "[0-9]+$" { print }' || true
+  else
+    echo "Source file summary:"
+    ls -lh "$input_path" || true
+  fi
+}
+
+drive_log_dir() {
+  local device_name="$1"
+  local timestamp
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  printf '%s/%s/%s\n' "$LOG_ROOT_DIR" "$device_name" "$timestamp"
+}
+
+run_logged_command() {
+  local log_file="$1"
+  shift
+
+  if "$@" > >(tee -a "$log_file") 2> >(tee -a "$log_file" >&2); then
+    return 0
+  fi
+
+  local cmd_status=$?
+  printf '%s\n' "Command failed with exit code $cmd_status: $*" | tee -a "$log_file" >&2
+  exit "$cmd_status"
+}
+
+show_fdisk_overview() {
+  local device_path="$1"
+  if command -v fdisk >/dev/null 2>&1; then
+    fdisk -l | grep "$device_path" || true
+  fi
+}
+
+show_device_identity() {
+  local device_path="$1"
+  if [[ "$device_path" == /dev/nvme* ]]; then
+    require_bin nvme
+    nvme id-ctrl "$device_path" | grep -E 'mn|sn' || true
+  else
+    require_bin hdparm
+    hdparm -I "$device_path" | grep "Model Number" || true
+    hdparm -I "$device_path" | grep "Serial Number" || true
+  fi
+}
+
+confirm_destructive_action() {
+  local prompt="$1"
+  local target_path="${2:-}"
+  printf '%s%s%s\n' "$C_ERR_BG" "WARNING: THIS WILL DESTROY DATA ON THE TARGET DEVICE." "$C_RESET"
+  warn "$prompt"
+  if [[ -n "$target_path" ]]; then
+    echo
+    show_path_summary "$target_path"
+  fi
+  if [[ -n "$target_path" ]]; then
+    confirm_target_path "$target_path"
+  elif [[ "$AUTO_YES" -eq 0 ]]; then
+    echo -n "Press [ENTER] to continue or Ctrl+C to exit..."
+    read -r _
+  fi
+}
+
+run_info() {
+  local device_path="$1"
+
+  require_bin lsblk
+
+  [[ -n "$device_path" ]] || die_code "$EXIT_USAGE" "disk-tool info requires DEVICE"
+  device_exists "$device_path" || die_code "$EXIT_DEVICE" "Block device not found: $device_path"
+
+  log "==> Device overview"
+  lsblk -nr -o PATH,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS,TRAN,RM,ROTA,MODEL,SERIAL | awk -v p="$device_path" '$1 == p || $1 ~ "^" p "p?[0-9]+$" || $1 ~ "^" p "[0-9]+$" { print }'
+  echo
+
+  if ! device_node_accessible "$device_path"; then
+    warn "Direct device access is unavailable in this environment. Showing lsblk-only summary."
+    return 0
+  fi
+
+  log "==> Partition table overview"
+  if command -v fdisk >/dev/null 2>&1; then
+    fdisk -l "$device_path" || true
+  fi
+  echo
+
+  log "==> Filesystem signatures"
+  if command -v wipefs >/dev/null 2>&1; then
+    wipefs "$device_path" || true
+  fi
+  echo
+
+  log "==> Device identity"
+  show_device_identity "$device_path"
+  echo
+
+  if command -v smartctl >/dev/null 2>&1; then
+    log "==> SMART health"
+    smartctl --info "$device_path" || true
+    smartctl --health "$device_path" || true
+  fi
+}
+
+run_benchmark() {
+  local device_path="$1"
+  local log_dir log_file device_slug
+
+  require_root
+  require_bin fio
+  [[ -n "$device_path" ]] || die_code "$EXIT_USAGE" "disk-tool benchmark requires DEVICE"
+  device_exists "$device_path" || die_code "$EXIT_DEVICE" "Block device not found: $device_path"
+
+  device_slug="$(basename -- "$device_path")"
+  log_dir="$(drive_log_dir "$device_slug")"
+  mkdir -p "$log_dir"
+  log_file="$log_dir/benchmark.log"
+
+  warn "This is a read-only benchmark, but it can heavily load the selected device."
+  show_path_summary "$device_path"
+  if [[ "$AUTO_YES" -eq 0 ]]; then
+    confirm_target_path "$device_path"
+  fi
+
+  run_logged_command "$log_file" fio --name=read-benchmark --filename="$device_path" --rw=read --direct=1 --bs=1M --iodepth=16 --time_based=1 --runtime=30 --group_reporting=1
+  ok "==> Benchmark completed"
+  ok "==> Logs saved in $log_dir"
+}
+
+run_drive() {
+  local device_path="$1"
+  local mode="$2"
+  local device_slug
+  local log_dir
+  local log_file
+
+  require_root
+  require_bin lsblk
+
+  if [[ -z "$device_path" ]]; then
+    printf '%sError: No device specified%s\n' "$C_ERR" "$C_RESET" >&2
+    echo >&2
+    drive_usage >&2
+    echo >&2
+    list_available_disks >&2
+    exit 1
+  fi
+
+  if [[ -z "$mode" ]]; then
+    printf '%sError: No mode specified%s\n' "$C_ERR" "$C_RESET" >&2
+    echo >&2
+    drive_usage >&2
+    exit 1
+  fi
+
+  if ! device_exists "$device_path"; then
+    printf '%sBlock device not found: %s%s\n' "$C_ERR" "$device_path" "$C_RESET" >&2
+    list_available_disks >&2
+    exit 1
+  fi
+
+  device_slug="$(basename -- "$device_path")"
+  log_dir="$(drive_log_dir "$device_slug")"
+  mkdir -p "$log_dir"
+  log_file="$log_dir/${mode}.log"
+  log "==> Logging to $log_file"
+
+  case "$mode" in
+    serial)
+      show_device_identity "$device_path" | tee -a "$log_file"
+      ;;
+    smart)
+      require_bin smartctl
+      run_logged_command "$log_file" smartctl --info "$device_path"
+      run_logged_command "$log_file" smartctl --attributes "$device_path"
+      run_logged_command "$log_file" smartctl --health "$device_path"
+      ;;
+    test)
+      require_bin badblocks
+      require_unmounted_target "$device_path" "disk-tool drive test"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command about to be run:"
+      echo "  /usr/bin/time --verbose badblocks -wvs $device_path"
+      echo
+      confirm_destructive_action "This performs a destructive write test." "$device_path"
+      run_logged_command "$log_file" /usr/bin/time --verbose badblocks -wvs "$device_path"
+      ;;
+    wipe)
+      require_bin shred
+      require_unmounted_target "$device_path" "disk-tool drive wipe"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command about to be run:"
+      echo "  /usr/bin/time --verbose shred --verbose --iterations=1 $device_path"
+      echo
+      confirm_destructive_action "This performs a single-pass shred wipe." "$device_path"
+      run_logged_command "$log_file" /usr/bin/time --verbose shred --verbose --iterations=1 "$device_path"
+      ;;
+    quick-wipe)
+      local size_bytes=0
+      local seek_mib=0
+      require_bin wipefs
+      require_bin blockdev
+      require_unmounted_target "$device_path" "disk-tool drive quick-wipe"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command sequence about to be run:"
+      echo "  wipefs -a $device_path"
+      echo "  dd if=/dev/zero of=$device_path bs=1M count=16 conv=fsync status=progress"
+      echo "  dd if=/dev/zero of=$device_path bs=1M seek=<last-16MiB> count=16 conv=fsync status=progress"
+      echo
+      confirm_destructive_action "This removes signatures and zeros the beginning and end of the device." "$device_path"
+      run_logged_command "$log_file" wipefs -a "$device_path"
+      run_logged_command "$log_file" dd if=/dev/zero of="$device_path" bs=1M count=16 conv=fsync status=progress
+      size_bytes="$(blockdev --getsize64 "$device_path")"
+      if [[ "$size_bytes" -gt 16777216 ]]; then
+        seek_mib=$(( size_bytes / 1048576 - 16 ))
+        run_logged_command "$log_file" dd if=/dev/zero of="$device_path" bs=1M seek="$seek_mib" count=16 conv=fsync status=progress
+      fi
+      ;;
+    full-wipe)
+      require_bin shred
+      require_unmounted_target "$device_path" "disk-tool drive full-wipe"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command about to be run:"
+      echo "  /usr/bin/time --verbose shred --verbose --iterations=7 --zero $device_path"
+      echo
+      confirm_destructive_action "This performs a 7-pass shred wipe and final zero pass." "$device_path"
+      run_logged_command "$log_file" /usr/bin/time --verbose shred --verbose --iterations=7 --zero "$device_path"
+      ;;
+    burnin)
+      require_bin badblocks
+      require_bin fio
+      require_bin smartctl
+      require_unmounted_target "$device_path" "disk-tool drive burnin"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command sequence about to be run:"
+      echo "  badblocks -o $log_dir/badblocks.txt $device_path"
+      echo "  fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename=$device_path --output=$log_dir/fio.log"
+      echo "  smartctl --health $device_path"
+      echo
+      confirm_destructive_action "This performs a destructive full-device burn-in and writes detailed logs." "$device_path"
+      run_logged_command "$log_file" badblocks -o "$log_dir/badblocks.txt" "$device_path"
+      run_logged_command "$log_file" fio --name=drive-test --readwrite=randrw --size=100% --runtime=3600 --filename="$device_path" --output="$log_dir/fio.log"
+      run_logged_command "$log_file" smartctl --health "$device_path"
+      ;;
+    discard)
+      require_bin blkdiscard
+      require_unmounted_target "$device_path" "disk-tool drive discard"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command about to be run:"
+      echo "  blkdiscard -f $device_path"
+      echo
+      confirm_destructive_action "This discards all blocks on supported SSD/NVMe devices." "$device_path"
+      run_logged_command "$log_file" blkdiscard -f "$device_path"
+      ;;
+    ata-erase)
+      require_bin hdparm
+      require_unmounted_target "$device_path" "disk-tool drive ata-erase"
+      if [[ "$device_path" == /dev/nvme* ]]; then
+        die "ATA erase is not valid for NVMe devices: $device_path"
+      fi
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command sequence about to be run:"
+      echo "  hdparm --security-set-pass NULL $device_path"
+      echo "  hdparm --security-erase NULL $device_path"
+      echo
+      confirm_destructive_action "This runs ATA secure erase on the selected device." "$device_path"
+      run_logged_command "$log_file" hdparm --security-set-pass NULL "$device_path"
+      run_logged_command "$log_file" hdparm --security-erase NULL "$device_path"
+      ;;
+    nvme-erase)
+      require_bin nvme
+      require_unmounted_target "$device_path" "disk-tool drive nvme-erase"
+      if [[ "$device_path" != /dev/nvme* ]]; then
+        die "NVMe erase is only valid for NVMe devices: $device_path"
+      fi
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command about to be run:"
+      echo "  nvme format $device_path --ses=1"
+      echo
+      confirm_destructive_action "This runs an NVMe secure erase format." "$device_path"
+      run_logged_command "$log_file" nvme format "$device_path" --ses=1
+      ;;
+    shred-erase)
+      require_bin shred
+      require_unmounted_target "$device_path" "disk-tool drive shred-erase"
+      show_device_identity "$device_path" | tee -a "$log_file"
+      show_fdisk_overview "$device_path" | tee -a "$log_file"
+      echo
+      warn "Command about to be run:"
+      echo "  /usr/bin/time --verbose shred --verbose -z -n 3 $device_path"
+      echo
+      confirm_destructive_action "This runs a 3-pass shred erase with a final zero pass." "$device_path"
+      run_logged_command "$log_file" /usr/bin/time --verbose shred --verbose -z -n 3 "$device_path"
+      ;;
+    *)
+      printf '%sUnknown drive mode: %s%s\n' "$C_ERR" "$mode" "$C_RESET" >&2
+      drive_usage >&2
+      exit 1
+      ;;
+  esac
+
+  ok "==> Drive operation completed"
+  ok "==> Logs saved in $log_dir"
+}
+
+case "$SUBCOMMAND" in
+  --setup)
+    shift
+    parse_all_flags "$@"
+    setup_prereqs
+    ;;
+  --install)
+    shift
+    parse_all_flags "$@"
+    install_launcher_from_file "$SCRIPT_PATH"
+    ;;
+  --update)
+    shift
+    parse_all_flags "$@"
+    if [[ -n "$REPO_RAW_URL" ]]; then
+      install_from_remote
+    else
+      install_launcher_from_file "$SCRIPT_PATH"
+    fi
+    ;;
+  doctor)
+    shift
+    parse_all_flags "$@"
+    run_doctor
+    ;;
+  list)
+    shift
+    parse_all_flags "$@"
+    list_available_disks
+    ;;
+  removable)
+    shift
+    parse_all_flags "$@"
+    list_removable_disks
+    ;;
+  info)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    if [[ $# -ne 1 ]]; then
+      die "disk-tool info requires DEVICE"
+    fi
+    run_info "$1"
+    ;;
+  benchmark)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    if [[ $# -ne 1 ]]; then
+      die "disk-tool benchmark requires DEVICE"
+    fi
+    run_benchmark "$1"
+    ;;
+  completion)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    case "${1:-}" in
+      bash)
+        print_bash_completion
+        ;;
+      install)
+        install_completion
+        ;;
+      *)
+        completion_usage >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  --help|help|-h)
+    usage
+    ;;
+  --version|version|-V)
+    printf '%s v%s\n' "$TOOL_NAME" "$VERSION"
+    ;;
+  dd)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    case "${1:-}" in
+      ""|--help|-h|help)
+        dd_usage
+        ;;
+      *)
+        if [[ $# -ne 2 ]]; then
+          printf '%sdisk-tool dd requires SOURCE and TARGET%s\n' "$C_ERR" "$C_RESET" >&2
+          dd_usage >&2
+          exit 1
+        fi
+        run_dd "$1" "$2"
+        ;;
+    esac
+    ;;
+  drive)
+    shift
+    parse_leading_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+    case "${1:-}" in
+      ""|--help|-h|help)
+        drive_usage
+        ;;
+      *)
+        if [[ $# -ne 2 ]]; then
+          printf '%sdisk-tool drive requires DEVICE and MODE%s\n' "$C_ERR" "$C_RESET" >&2
+          drive_usage >&2
+          exit 1
+        fi
+        run_drive "$1" "$2"
+        ;;
+    esac
+    ;;
+  *)
+    printf '%sUnknown command: %s%s\n' "$C_ERR" "$SUBCOMMAND" "$C_RESET" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
