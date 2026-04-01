@@ -9,7 +9,7 @@ while [[ -L "$SOURCE_PATH" ]]; do
 done
 SCRIPT_PATH="$(cd -- "$(dirname -- "$SOURCE_PATH")" && pwd)/$(basename -- "$SOURCE_PATH")"
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 TOOL_NAME="disk-tool"
 SUBCOMMAND="${1:-help}"
 
