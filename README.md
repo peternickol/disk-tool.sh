@@ -119,6 +119,17 @@ Safety behaviors:
 `--yes` is intended for trusted automation or experienced use. It should be used
 carefully.
 
+## Common Flags
+
+These flags are used across the CLI:
+
+- `--log` writes log files for supported commands such as `benchmark` and `drive`
+- `--dry-run` prints the command or command sequence without executing it
+- `-y` or `--yes` skips destructive confirmation prompts
+- `--verify` adds a post-write verification step to `disk-tool dd`
+- `--force` overrides mounted-device refusal for destructive commands
+- `--no-completion` skips bash completion install during `--setup` or `--install`
+
 ## Installation And Setup
 
 ### One-shot setup
@@ -170,32 +181,17 @@ Skip completion install if needed:
 
 ### Updating
 
-Update from the script you already have:
-
-```bash
-./disk-tool --update
-```
-
-Update from the public repository:
-
-```bash
-disk-tool --update
-```
-
-By default, `disk-tool` updates from:
-
-```text
-https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool
-```
-
-You can still override that with `DISK_TOOL_RAW_URL` if needed.
-
-## Public Update Source
-
 `disk-tool --update` uses this public raw script URL by default:
 
 ```text
 https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool
+```
+
+Examples:
+
+```bash
+./disk-tool --update
+disk-tool --update
 ```
 
 Optional override:
@@ -281,6 +277,9 @@ It combines:
 - model/serial identity
 - SMART info and health when available
 
+If direct device access is not available, `disk-tool` falls back to an
+`lsblk`-only summary.
+
 Example:
 
 ```bash
@@ -331,7 +330,9 @@ Runs a read-only benchmark against a block device using `fio`.
 Notes:
 
 - this is not destructive
+- this command requires root
 - it can heavily load the selected disk
+- it asks you to confirm the exact device path unless `--yes` is used
 - use `--log` if you want a benchmark log written to disk
 - it currently runs a timed read test for 30 seconds
 
@@ -360,6 +361,7 @@ Notes:
 - destructive confirmation requires the exact target path unless `--yes` is used
 - `--dry-run` prints the write and verify commands without executing them
 - `--verify` compares the written output against the source file after writing when `SOURCE` is a regular file
+- `--log` does not change `dd` behavior because `dd` does not write disk logs
 
 Example:
 
@@ -445,6 +447,7 @@ Notes:
 
 - destructive
 - mounted targets are refused unless `--force` is used
+- exact target-path confirmation is required unless `--yes` is used
 
 Example:
 
@@ -464,6 +467,7 @@ Notes:
 
 - destructive
 - mounted targets are refused unless `--force` is used
+- exact target-path confirmation is required unless `--yes` is used
 
 Example:
 
@@ -482,6 +486,12 @@ Runs a faster signature-oriented wipe flow:
 This is useful when you want to quickly remove partitioning and common
 filesystem signatures without doing a full multi-pass wipe.
 
+Notes:
+
+- destructive
+- mounted targets are refused unless `--force` is used
+- exact target-path confirmation is required unless `--yes` is used
+
 Example:
 
 ```bash
@@ -496,6 +506,12 @@ Runs:
 /usr/bin/time --verbose shred --verbose --iterations=7 --zero /dev/DEVICE
 ```
 
+Notes:
+
+- destructive
+- mounted targets are refused unless `--force` is used
+- exact target-path confirmation is required unless `--yes` is used
+
 Example:
 
 ```bash
@@ -504,7 +520,7 @@ sudo disk-tool drive /dev/sdd full-wipe
 
 ##### `burnin`
 
-Runs a destructive validation sequence with logs:
+Runs a destructive validation sequence:
 
 - `badblocks`
 - `fio`
@@ -515,6 +531,7 @@ Notes:
 - destructive
 - mounted targets are refused unless `--force` is used
 - use `--log` if you want `badblocks`, `fio`, and command output saved to disk
+- exact target-path confirmation is required unless `--yes` is used
 - `fio` is configured for a one-hour timed run
 
 Example:
@@ -533,6 +550,12 @@ blkdiscard -f /dev/DEVICE
 ```
 
 This is intended for supported SSD and NVMe devices.
+
+Notes:
+
+- destructive
+- mounted targets are refused unless `--force` is used
+- exact target-path confirmation is required unless `--yes` is used
 
 Example:
 
@@ -556,6 +579,7 @@ Notes:
 - destructive
 - mounted targets are refused unless `--force` is used
 - valid for non-NVMe devices
+- exact target-path confirmation is required unless `--yes` is used
 
 Example:
 
@@ -576,6 +600,7 @@ Notes:
 - destructive
 - mounted targets are refused unless `--force` is used
 - valid only for NVMe devices
+- exact target-path confirmation is required unless `--yes` is used
 
 Example:
 
@@ -595,6 +620,7 @@ Notes:
 
 - destructive
 - mounted targets are refused unless `--force` is used
+- exact target-path confirmation is required unless `--yes` is used
 
 Example:
 
@@ -670,7 +696,7 @@ sudo disk-tool benchmark /dev/nvme0n1
 ### Burn in a drive and keep logs
 
 ```bash
-sudo disk-tool drive /dev/sdc burnin
+sudo disk-tool drive --log /dev/sdc burnin
 ```
 
 ### Quickly clear signatures on a device
