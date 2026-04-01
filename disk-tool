@@ -13,7 +13,8 @@ VERSION="0.1.0"
 TOOL_NAME="disk-tool"
 SUBCOMMAND="${1:-help}"
 
-REPO_RAW_URL="${DISK_TOOL_RAW_URL:-}"
+DEFAULT_REPO_RAW_URL="https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool"
+REPO_RAW_URL="${DISK_TOOL_RAW_URL:-$DEFAULT_REPO_RAW_URL}"
 INSTALL_FORCE=0
 AUTO_YES=0
 NO_COMPLETION=0
@@ -78,7 +79,7 @@ General:
   --verify                   After dd, verify written output against the source file
 
 Environment:
-  DISK_TOOL_RAW_URL          Optional raw script URL for curl-based installs/updates
+  DISK_TOOL_RAW_URL          Override the default raw script URL for curl-based installs/updates
 EOF
 }
 
@@ -451,10 +452,6 @@ install_launcher_from_file() {
 
 download_remote_script() {
   local temp_script
-
-  if [[ -z "$REPO_RAW_URL" ]]; then
-    die "Remote update URL not configured. Set DISK_TOOL_RAW_URL to a raw script URL."
-  fi
 
   require_bin curl
 

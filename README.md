@@ -159,19 +159,26 @@ Update from the script you already have:
 ./disk-tool --update
 ```
 
-Update from a remote raw URL:
+Update from the public repository:
 
 ```bash
-export DISK_TOOL_RAW_URL="https://raw.githubusercontent.com/OWNER/REPO/main/disk-tool"
 disk-tool --update
 ```
 
-## GitHub-Friendly Install Examples
+By default, `disk-tool` updates from:
+
+```text
+https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool
+```
+
+You can still override that with `DISK_TOOL_RAW_URL` if needed.
+
+## GitHub Install Examples
 
 Example raw install pattern:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/disk-tool -o disk-tool
+curl -fsSL https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool -o disk-tool
 chmod +x disk-tool
 sudo ./disk-tool --install
 ```
@@ -179,11 +186,15 @@ sudo ./disk-tool --install
 Example raw update pattern:
 
 ```bash
-export DISK_TOOL_RAW_URL="https://raw.githubusercontent.com/OWNER/REPO/main/disk-tool"
 disk-tool --update
 ```
 
-Replace `OWNER/REPO` with the actual GitHub repository path.
+Optional override:
+
+```bash
+export DISK_TOOL_RAW_URL="https://raw.githubusercontent.com/peternickol/disk-tool.sh/master/disk-tool"
+disk-tool --update
+```
 
 ## Bash Completion
 
